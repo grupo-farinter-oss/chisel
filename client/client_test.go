@@ -4,6 +4,7 @@ import (
 	"crypto/elliptic"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +12,39 @@ import (
 	"github.com/jpillora/chisel/share/ccrypto"
 	"golang.org/x/crypto/ssh"
 )
+
+func TestNewClientParsesRemotesJSONAtRemoteConfigBoundary(t *testing.T) {
+	config := Config{Server: "http://localhost"}
+	if _, err := NewClientWithRemotesJSON(&config, []byte(`["9000","R:2222:localhost:22"]`)); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"9000", "R:2222:localhost:22"}
+	if !reflect.DeepEqual(config.Remotes, want) {
+		t.Fatalf("parsed remotes = %q, want %q", config.Remotes, want)
+	}
+}
+
+func TestNewClientRemotesJSONErrorsAndPositionalPrecedence(t *testing.T) {
+	for _, value := range []string{"", `[{`, `[]`, `null`, `[3000]`, `[" "]`} {
+		t.Run(value, func(t *testing.T) {
+			_, err := NewClientWithRemotesJSON(&Config{Server: "http://localhost"}, []byte(value))
+			if err == nil {
+				t.Fatalf("NewClient accepted invalid remotes JSON %q", value)
+			}
+		})
+	}
+
+	config := Config{
+		Server:  "http://localhost",
+		Remotes: []string{"9000"},
+	}
+	if _, err := NewClientWithRemotesJSON(&config, []byte(`invalid`)); err != nil {
+		t.Fatalf("positional remotes should take precedence over JSON: %v", err)
+	}
+	if !reflect.DeepEqual(config.Remotes, []string{"9000"}) {
+		t.Fatalf("positional remotes changed: %q", config.Remotes)
+	}
+}
 
 func TestCustomHeaders(t *testing.T) {
 	//fake server, records the header for the main goroutine to

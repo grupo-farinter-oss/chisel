@@ -87,6 +87,24 @@ The `authfile` (`users.json`) remains the same as in the non-containerized versi
 }
 ```
 
+To use environment-based ACL configuration instead of the file mount, add this alternative service configuration. `CHISEL_AUTH_JSON_B64` contains the same JSON object as `users.json`; provide it through deployment environment or secret settings. Base64 is not encryption. When either auth JSON environment variable is set, it takes precedence over `--authfile`.
+
+```yaml
+version: '3'
+
+services:
+  chisel:
+    image: jpillora/chisel
+    restart: unless-stopped
+    container_name: chisel
+    command:
+      - 'server'
+      - '--reverse'
+    environment:
+      CHISEL_AUTH_JSON_B64: ${CHISEL_AUTH_JSON_B64:?Set the users.json JSON as Base64}
+    network_mode: host
+```
+
 ### Client
 
 Setup an instance of the Chisel client on the Pi to receive relayed TCP traffic and feed it to the web server:
