@@ -1,0 +1,21 @@
+name: Fork image
+on:
+  push:
+    branches: [master]
+permissions:
+  contents: read
+  packages: write
+jobs:
+  publish:
+    if: github.repository == 'grupo-farinter-oss/chisel'
+    name: Publish fork image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up ko
+        uses: ko-build/setup-ko@v0.6
+      - name: Build and publish multi-platform image
+        env:
+          KO_DEFAULTBASEIMAGE: cgr.dev/chainguard/static:latest
+        run: ko build --bare --platform=linux/amd64,linux/arm64 --image-label "org.opencontainers.image.revision=${GITHUB_SHA}" .
