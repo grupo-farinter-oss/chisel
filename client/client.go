@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -39,7 +40,7 @@ type Config struct {
 	MaxRetryInterval time.Duration                                                     `opts:"name=max-retry-interval,short=-" help:"Maximum wait time before retrying after a disconnection. Defaults to 5 minutes."`
 	Server           string                                                            `opts:"name=server,mode=arg"`
 	Proxy            string                                                            `opts:"name=proxy,short=-" help:"An optional HTTP CONNECT or SOCKS5 proxy which will be used to reach the chisel server. Authentication can be specified inside the URL. Credentials must be URL-encoded; for example a \"#\" in the password must be written as \"%23\".\nFor example, http://admin:password@my-server.com:8081\n        or: socks://admin:password@my-server.com:1080\nThe socks://, socks5:// and socks5h:// schemes are equivalent: DNS is always resolved by the proxy."`
-	Remotes          []string                                                          `opts:"name=remote,mode=arg,min=1"`
+	Remotes          []string                                                          `opts:"name=remote,mode=arg"`
 	Headers          http.Header                                                       `opts:"-"`
 	TLS              TLSConfig                                                         `opts:"mode=embedded"`
 	DialContext      func(ctx context.Context, network, addr string) (net.Conn, error) `opts:"-"`
@@ -201,6 +202,22 @@ func NewClient(c *Config) (*Client, error) {
 		KeepAlive: client.config.KeepAlive,
 	})
 	return client, nil
+}
+
+// NewClientWithRemotesJSON parses JSON remotes when positional remotes are absent.
+func NewClientWithRemotesJSON(c *Config, data []byte) (*Client, error) {
+	if len(c.Remotes) > 0 {
+		return NewClient(c)
+	}
+	var remotes []string
+	if err := json.Unmarshal(data, &remotes); err != nil {
+		return nil, fmt.Errorf("invalid client remotes JSON: %w", err)
+	}
+	if len(remotes) == 0 {
+		return nil, errors.New("client remotes JSON must contain at least one remote")
+	}
+	c.Remotes = remotes
+	return NewClient(c)
 }
 
 // Run starts client and blocks while connected

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net/http"
@@ -74,6 +75,7 @@ func newServerCLI(serverConfig *serverOptions) opts.Opts {
 		Summary("runs chisel in server mode").
 		Repo(chiselRepo).
 		DocSet("version", versionTemplate).
+		DocAfter("summary", "authenv", serverAuthEnvironmentTemplate).
 		DocAfter("flaggroups", "signals", signalsTemplate)
 }
 
@@ -132,6 +134,11 @@ const signalsTemplate = "\n{{bold \"Signals:\"}}\n" +
 	"{{.Pad}}  a SIGUSR2 to print process stats, and\n" +
 	"{{.Pad}}  a SIGHUP to short-circuit the client reconnect timer\n"
 
+const serverAuthEnvironmentTemplate = `
+CHISEL_AUTH_JSON_B64 is preferred; CHISEL_AUTH_JSON accepts raw users.json.
+Environment config overrides --authfile and is loaded only at startup.
+`
+
 func generatePidFile() error {
 	pid := []byte(strconv.Itoa(os.Getpid()))
 	return os.WriteFile("chisel.pid", pid, 0644)
@@ -159,6 +166,7 @@ type serverOptions struct {
 	Port   string `opts:"name=port,short=p" help:"Defines the HTTP listening port (defaults to the environment variable PORT and falls back to port 8080)."`
 	KeyGen string `opts:"name=keygen,short=-" help:"A path to write a newly generated PEM-encoded SSH private key file. If users depend on your --key fingerprint, you may also include your --key to output your existing key. Use - (dash) to output the generated key to stdout."`
 	chserver.Config
+	AuthJSON   []byte           `opts:"-"`
 	ProxyAlias sharedStringFlag `opts:"name=proxy,mode=flag,short=-" help:"Alias for --backend."`
 	PID        bool             `opts:"name=pid,short=-" help:"Generate pid file in current working directory"`
 	Verbose    bool             `opts:"name=verbose,short=v" help:"Enable verbose logging"`
@@ -169,6 +177,46 @@ func newServerOptions() *serverOptions {
 	o.Config.KeepAlive = 25 * time.Second
 	o.ProxyAlias.target = &o.Config.Proxy
 	return o
+}
+
+func decodeStandardBase64(value string) ([]byte, error) {
+	decoded, err := base64.StdEncoding.Strict().DecodeString(value)
+	if err != nil {
+		return base64.RawStdEncoding.Strict().DecodeString(value)
+	}
+	return decoded, nil
+}
+
+func resolveServerAuthJSON(rawJSON string, rawSet bool, encodedJSON string, encodedSet bool) ([]byte, bool, error) {
+	if encodedSet {
+		decoded, err := decodeStandardBase64(encodedJSON)
+		if err != nil {
+			return nil, false, fmt.Errorf("CHISEL_AUTH_JSON_B64 must be Base64-encoded users.json")
+		}
+		if decoded == nil {
+			decoded = make([]byte, 0)
+		}
+		return decoded, true, nil
+	}
+	if rawSet {
+		data := make([]byte, len(rawJSON))
+		copy(data, rawJSON)
+		return data, true, nil
+	}
+	return nil, false, nil
+}
+
+func (o *serverOptions) resolveAuthJSON() error {
+	rawJSON, rawSet := os.LookupEnv("CHISEL_AUTH_JSON")
+	encodedJSON, encodedSet := os.LookupEnv("CHISEL_AUTH_JSON_B64")
+	data, set, err := resolveServerAuthJSON(rawJSON, rawSet, encodedJSON, encodedSet)
+	if err != nil {
+		return err
+	}
+	if set {
+		o.AuthJSON = data
+	}
+	return nil
 }
 
 func (o *serverOptions) Run() error {
@@ -204,7 +252,16 @@ func (o *serverOptions) Run() error {
 	if config.Auth == "" {
 		config.Auth = os.Getenv("AUTH")
 	}
-	s, err := chserver.NewServer(config)
+	if err := o.resolveAuthJSON(); err != nil {
+		return err
+	}
+	var s *chserver.Server
+	var err error
+	if o.AuthJSON != nil {
+		s, err = chserver.NewServerWithAuthJSON(config, o.AuthJSON)
+	} else {
+		s, err = chserver.NewServer(config)
+	}
 	if err != nil {
 		return err
 	}
@@ -274,6 +331,10 @@ from the client to the server's <local-interface>:<local-port>.
     stdio:example.com:22
     1.1.1.1:53/udp
 
+  Without positional remotes, use CHISEL_REMOTES_JSON_B64 (preferred; Base64
+  JSON) or CHISEL_REMOTES_JSON (raw JSON). Positional remotes win; B64 wins if
+  both are set. One source is required.
+
   When the chisel server has --socks5 enabled, remotes can
   specify "socks" or "udpsocks" in place of remote-host and
   remote-port. Both default to the local host and port
@@ -312,10 +373,11 @@ from the client to the server's <local-interface>:<local-port>.
 // Field order determines the order flags appear in the help text.
 type clientOptions struct {
 	chclient.Config
-	Header   []string `opts:"name=header,short=-" help:"Set a custom header in the form \"HeaderName: HeaderContent\". Can be used multiple times. (e.g --header \"Foo: Bar\" --header \"Hello: World\")"`
-	Hostname string   `opts:"name=hostname,short=-" help:"Optionally set the 'Host' header (defaults to the host found in the server url)."`
-	SNI      string   `opts:"name=sni,short=-" help:"Override the ServerName when using TLS (defaults to the hostname)."`
-	PID      bool     `opts:"name=pid,short=-" help:"Generate pid file in current working directory"`
+	RemotesJSON []byte   `opts:"-"`
+	Header      []string `opts:"name=header,short=-" help:"Set a custom header in the form \"HeaderName: HeaderContent\". Can be used multiple times. (e.g --header \"Foo: Bar\" --header \"Hello: World\")"`
+	Hostname    string   `opts:"name=hostname,short=-" help:"Optionally set the 'Host' header (defaults to the host found in the server url)."`
+	SNI         string   `opts:"name=sni,short=-" help:"Override the ServerName when using TLS (defaults to the hostname)."`
+	PID         bool     `opts:"name=pid,short=-" help:"Generate pid file in current working directory"`
 }
 
 func newClientOptions() *clientOptions {
@@ -326,7 +388,46 @@ func newClientOptions() *clientOptions {
 	return o
 }
 
+func resolveClientRemotes(cliRemotes []string, rawJSON string, rawJSONSet bool, encodedJSON string, encodedJSONSet bool) ([]byte, bool, error) {
+	if len(cliRemotes) > 0 {
+		return nil, false, nil
+	}
+
+	if encodedJSONSet {
+		decoded, err := decodeStandardBase64(encodedJSON)
+		if err != nil {
+			return nil, false, fmt.Errorf("CHISEL_REMOTES_JSON_B64 must be Base64-encoded JSON array of remote strings")
+		}
+		if decoded == nil {
+			decoded = make([]byte, 0)
+		}
+		return decoded, true, nil
+	}
+	if rawJSONSet {
+		data := make([]byte, len(rawJSON))
+		copy(data, rawJSON)
+		return data, true, nil
+	}
+	return nil, false, fmt.Errorf("at least one remote must be provided as an argument, CHISEL_REMOTES_JSON_B64, or CHISEL_REMOTES_JSON")
+}
+
+func (o *clientOptions) resolveRemotes() error {
+	remoteJSON, remoteJSONSet := os.LookupEnv("CHISEL_REMOTES_JSON")
+	remoteJSONB64, remoteJSONB64Set := os.LookupEnv("CHISEL_REMOTES_JSON_B64")
+	remotesJSON, set, err := resolveClientRemotes(o.Config.Remotes, remoteJSON, remoteJSONSet, remoteJSONB64, remoteJSONB64Set)
+	if err != nil {
+		return err
+	}
+	if set {
+		o.RemotesJSON = remotesJSON
+	}
+	return nil
+}
+
 func (o *clientOptions) Run() error {
+	if err := o.resolveRemotes(); err != nil {
+		return err
+	}
 	config := &o.Config
 	for _, header := range o.Header {
 		if err := setHeader(config.Headers, header); err != nil {
@@ -348,7 +449,13 @@ func (o *clientOptions) Run() error {
 	}
 
 	//ready
-	c, err := chclient.NewClient(config)
+	var c *chclient.Client
+	var err error
+	if o.RemotesJSON != nil {
+		c, err = chclient.NewClientWithRemotesJSON(config, o.RemotesJSON)
+	} else {
+		c, err = chclient.NewClient(config)
+	}
 	if err != nil {
 		return err
 	}

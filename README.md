@@ -115,6 +115,9 @@ $ chisel server --help
 
   Usage: chisel server [options]
 
+  CHISEL_AUTH_JSON_B64 is preferred; CHISEL_AUTH_JSON accepts raw users.json.
+  Environment config overrides --authfile and is loaded only at startup.
+
   Options:
 
     --host, Defines the HTTP listening host – the network interface
@@ -232,7 +235,7 @@ $ chisel server --help
 ``` plain 
 $ chisel client --help
 
-  Usage: chisel client [options] <server> <remote> [remote] [remote] ...
+  Usage: chisel client [options] <server> [remote] [remote] [remote] ...
 
   <server> is the URL to the chisel server.
 
@@ -271,6 +274,10 @@ $ chisel client --help
       R:5000:udpsocks
       stdio:example.com:22
       1.1.1.1:53/udp
+
+    Without positional remotes, use CHISEL_REMOTES_JSON_B64 (preferred; Base64
+    JSON) or CHISEL_REMOTES_JSON (raw JSON). Positional remotes win; B64 wins if
+    both are set. One source is required.
 
     When the chisel server has --socks5 enabled, remotes can
     specify "socks" or "udpsocks" in place of remote-host and
@@ -407,6 +414,8 @@ The server also caps inbound websocket message sizes before authentication (`CHI
 
 Using the `--authfile` option, the server may optionally provide a `user.json` configuration file to create a list of accepted users. The client then authenticates using the `--auth` option. See [users.json](example/users.json) for an example authentication configuration file. See the `--help` above for more information.
 
+To avoid mounting `users.json` in a container, provide the same JSON object with `CHISEL_AUTH_JSON` or preferred `CHISEL_AUTH_JSON_B64`. Environment ACLs override `--authfile` and load only at startup; they do not live-reload.
+
 Notes on authfile behavior:
 
 - The file is watched and **reloaded live** — including editor saves via rename (vim) and kubernetes configmap updates. Reloads apply to new connections and to new tunnels of already-connected clients; removed users lose access to new tunnels immediately, though established tunnels are not interrupted.
@@ -517,10 +526,23 @@ Less common knobs are environment variables, all read with a `CHISEL_` prefix (e
 | `UDP_DEADLINE`  | both        | `15s`              | udp flow read deadline and return-peer expiry; SOCKS UDP destination idle timeout |
 | `UDP_MAX_CONNS` | both        | `100`              | max udp flows or return peers; SOCKS UDP associations per listener and destinations per association |
 | `SHUTDOWN_GRACE`| server      | `5s`               | http request drain time on shutdown                |
+| `REMOTES_JSON` | client | unset | JSON array of native remote strings |
+| `REMOTES_JSON_B64` | client | unset | Preferred Base64-encoded JSON array |
+| `AUTH_JSON` | server | unset | Raw users.json object; overrides `--authfile` |
+| `AUTH_JSON_B64` | server | unset | Preferred Base64-encoded users.json object |
 
 `HOST`, `PORT`, `AUTH`, and `CHISEL_KEY`/`CHISEL_KEY_FILE` are documented in the `--help` texts above.
 
 SOCKS UDP uses hard association and destination limits and drops packets beyond them. Each association queues up to 16 outbound datagrams; full queues drop packets without blocking other clients. For SOCKS UDP, nonpositive size/connection limits or idle deadlines use the defaults, and packet size is capped at 65507 bytes. Operating systems can impose a smaller UDP send limit: macOS defaults to 9216 bytes (`net.inet.udp.maxdgram`). The default 9012-byte Chisel limit fits within that bound.
+
+If positional remotes are omitted, either variable can provide the remotes;
+B64 takes precedence if both are set and accepts padded or unpadded standard
+Base64.
+
+For ACLs, `CHISEL_AUTH_JSON_B64` takes precedence over `CHISEL_AUTH_JSON`; either
+overrides `--authfile`. Base64 accepts padded or unpadded standard encoding but
+does not encrypt the credentials. Environment ACLs load at startup and do not
+live-reload.
 
 #### Caveats
 

@@ -108,6 +108,12 @@ func (u *UserIndex) LoadUsers(configFile string) error {
 	return nil
 }
 
+// LoadUsersJSON loads a users.json object without installing a file watcher.
+func (u *UserIndex) LoadUsersJSON(data []byte) error {
+	u.Infof("Loading users configuration from JSON")
+	return u.loadUsers(data, "auth JSON")
+}
+
 // addWatchEvents is responsible for watching for updates to the file and reloading
 func (u *UserIndex) addWatchEvents() error {
 	watcher, err := fsnotify.NewWatcher()
@@ -207,8 +213,12 @@ func (u *UserIndex) loadUserIndex() error {
 	if err != nil {
 		return fmt.Errorf("Failed to read auth file: %s, error: %s", u.configFile, err)
 	}
+	return u.loadUsers(b, "authfile")
+}
+
+func (u *UserIndex) loadUsers(data []byte, source string) error {
 	var raw map[string][]string
-	if err := json.Unmarshal(b, &raw); err != nil {
+	if err := json.Unmarshal(data, &raw); err != nil {
 		return errors.New("Invalid JSON: " + err.Error())
 	}
 	users := []*User{}
@@ -227,8 +237,8 @@ func (u *UserIndex) loadUserIndex() error {
 					return errors.New("Invalid address regex")
 				}
 				if !strings.HasPrefix(r, "^") || !strings.HasSuffix(r, "$") {
-					u.Infof("authfile: pattern %q (user %s) is unanchored and "+
-						"may match unintended addresses; anchor it with ^ and $", r, user.Name)
+					u.Infof("%s: pattern %q (user %s) is unanchored and "+
+						"may match unintended addresses; anchor it with ^ and $", source, r, user.Name)
 				}
 				user.Addrs = append(user.Addrs, re)
 			}

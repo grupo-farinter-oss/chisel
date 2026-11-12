@@ -3,6 +3,8 @@ package chserver
 import (
 	"bytes"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -109,5 +111,46 @@ func TestInvalidAuthString(t *testing.T) {
 	//auth strings without a colon used to silently disable auth
 	if _, err := NewServer(&Config{KeySeed: "x", Auth: "nocolon"}); err == nil {
 		t.Fatal("server accepted --auth without a colon")
+	}
+}
+
+func TestAuthJSONOverridesAuthFileAndPreservesAuthUser(t *testing.T) {
+	server, err := NewServerWithAuthJSON(&Config{
+		KeySeed:  "auth-json-test",
+		Auth:     "pinned:example-password",
+		AuthFile: filepath.Join(t.TempDir(), "missing-users.json"),
+	}, []byte(`{"alice:example-password":["^127\\.0\\.0\\.1:80$"]}`))
+	if err != nil {
+		t.Fatalf("NewServer() with JSON ACL should ignore lower-precedence missing authfile: %v", err)
+	}
+	if _, found := server.users.Get("alice"); !found {
+		t.Fatal("JSON ACL user was not loaded")
+	}
+	if _, found := server.users.Get("pinned"); !found {
+		t.Fatal("pinned AUTH user was not preserved")
+	}
+}
+
+func TestAuthFileStillLoadsWhenAuthJSONIsUnset(t *testing.T) {
+	authFile := filepath.Join(t.TempDir(), "users.json")
+	if err := os.WriteFile(authFile, []byte(`{"alice:example-password":["^"]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(&Config{KeySeed: "authfile-compatibility-test", AuthFile: authFile})
+	if err != nil {
+		t.Fatalf("NewServer() with only AuthFile: %v", err)
+	}
+	if _, found := server.users.Get("alice"); !found {
+		t.Fatal("existing AuthFile user was not loaded")
+	}
+}
+
+func TestInvalidAuthJSONDoesNotFallBackToAuthFile(t *testing.T) {
+	authFile := filepath.Join(t.TempDir(), "users.json")
+	if err := os.WriteFile(authFile, []byte(`{"alice:example-password":[""]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewServerWithAuthJSON(&Config{KeySeed: "invalid-auth-json-test", AuthFile: authFile}, []byte{}); err == nil {
+		t.Fatal("invalid JSON ACL should fail instead of falling back to authfile")
 	}
 }

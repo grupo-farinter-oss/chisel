@@ -1,12 +1,17 @@
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	chclient "github.com/jpillora/chisel/client"
+	chserver "github.com/jpillora/chisel/server"
 	"github.com/jpillora/opts"
 )
 
@@ -227,5 +232,185 @@ func TestClientOptions(t *testing.T) {
 	}
 	if client.KeepAlive != 15*time.Second || client.MaxRetryCount != 7 || !client.Config.TLS.SkipVerify || !client.PID || !client.Verbose {
 		t.Fatalf("client options not parsed: %+v", client)
+	}
+}
+
+func TestClientOptionsAllowRemotesFromEnvironment(t *testing.T) {
+	client := newClientOptions()
+	cli := newCLI(newServerOptions(), client)
+	_, err := cli.ParseArgsError([]string{"chisel", "client", "https://server.example"})
+	if err != nil {
+		t.Fatalf("client command without positional remotes should parse for env fallback: %v", err)
+	}
+	if len(client.Remotes) != 0 {
+		t.Fatalf("unexpected positional remotes: %q", client.Remotes)
+	}
+	remoteConfig := base64.StdEncoding.EncodeToString([]byte(`["R:0.0.0.0:4000:code-server:4000","0.0.0.0:15432:postgres:5432"]`))
+	t.Setenv("CHISEL_REMOTES_JSON_B64", remoteConfig)
+	if err := client.resolveRemotes(); err != nil {
+		t.Fatalf("resolveRemotes() error = %v", err)
+	}
+	if len(client.Remotes) != 0 {
+		t.Fatalf("env JSON parsed in CLI instead of being passed to client: %q", client.Remotes)
+	}
+	if _, err := chclient.NewClientWithRemotesJSON(&client.Config, client.RemotesJSON); err != nil {
+		t.Fatalf("NewClient() with env JSON: %v", err)
+	}
+	want := []string{"R:0.0.0.0:4000:code-server:4000", "0.0.0.0:15432:postgres:5432"}
+	if !reflect.DeepEqual(client.Remotes, want) {
+		t.Fatalf("client remotes after NewClient() = %q, want %q", client.Remotes, want)
+	}
+}
+
+func TestResolveServerAuthJSONSourceAndPrecedence(t *testing.T) {
+	rawJSON := `{"alice:example-password":["^127\\.0\\.0\\.1:80$"]}`
+	wantB64 := `{"bob:example-password":["^127\\.0\\.0\\.1:443$"]}`
+	for name, encoded := range map[string]string{
+		"padded":   base64.StdEncoding.EncodeToString([]byte(wantB64)),
+		"unpadded": base64.RawStdEncoding.EncodeToString([]byte(wantB64)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, set, err := resolveServerAuthJSON(rawJSON, true, encoded, true)
+			if err != nil || !set || string(got) != wantB64 {
+				t.Fatalf("B64 auth JSON = %q, %t, %v; want %q", got, set, err, wantB64)
+			}
+		})
+	}
+
+	got, set, err := resolveServerAuthJSON(rawJSON, true, "", false)
+	if err != nil || !set || string(got) != rawJSON {
+		t.Fatalf("raw auth JSON = %q, %t, %v", got, set, err)
+	}
+
+}
+
+func TestResolveServerAuthJSONInvalidB64DoesNotFallBack(t *testing.T) {
+	if _, set, err := resolveServerAuthJSON(`{"alice:pw":[""]}`, true, `%bad`, true); err == nil || set {
+		t.Fatalf("invalid B64 must error without selecting raw JSON; set=%t err=%v", set, err)
+	}
+}
+
+func TestServerOptionsResolveAuthJSONEnvironment(t *testing.T) {
+	option := newServerOptions()
+	rawJSON := `{"alice:example-password":["^127\\.0\\.0\\.1:80$"]}`
+	b64JSON := base64.StdEncoding.EncodeToString([]byte(`{"bob:example-password":["^127\\.0\\.0\\.1:443$"]}`))
+	t.Setenv("CHISEL_AUTH_JSON", rawJSON)
+	t.Setenv("CHISEL_AUTH_JSON_B64", b64JSON)
+	if err := option.resolveAuthJSON(); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(option.AuthJSON), `{"bob:example-password":["^127\\.0\\.0\\.1:443$"]}`; got != want {
+		t.Fatalf("resolved AuthJSON = %q, want B64 value %q", got, want)
+	}
+}
+
+func TestEmptyServerAuthJSONB64FailsWithoutFallingBack(t *testing.T) {
+	authFile := filepath.Join(t.TempDir(), "users.json")
+	if err := os.WriteFile(authFile, []byte(`{"alice:example-password":[""]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	option := newServerOptions()
+	option.Config.KeySeed = "empty-auth-json-b64-test"
+	option.Config.AuthFile = authFile
+	t.Setenv("CHISEL_AUTH_JSON", `{"bob:example-password":[""]}`)
+	t.Setenv("CHISEL_AUTH_JSON_B64", "")
+	if err := option.resolveAuthJSON(); err != nil {
+		t.Fatalf("empty but set B64 should select an env source, then fail JSON loading: %v", err)
+	}
+	if option.AuthJSON == nil {
+		t.Fatal("empty but set B64 was treated as unset instead of taking precedence")
+	}
+	if _, err := chserver.NewServerWithAuthJSON(&option.Config, option.AuthJSON); err == nil {
+		t.Fatal("server fell back to the valid authfile for empty preferred B64 config")
+	}
+}
+
+func TestServerOptionsResolveEmptyAuthJSONB64WithExistingSemantics(t *testing.T) {
+	for _, value := range []string{`{}`, `null`} {
+		t.Run(value, func(t *testing.T) {
+			option := newServerOptions()
+			option.Config.KeySeed = "empty-auth-json-semantics-test"
+			option.Config.AuthFile = filepath.Join(t.TempDir(), "missing-users.json")
+			t.Setenv("CHISEL_AUTH_JSON", `{"alice:example-password":[""]}`)
+			t.Setenv("CHISEL_AUTH_JSON_B64", base64.StdEncoding.EncodeToString([]byte(value)))
+			if err := option.resolveAuthJSON(); err != nil {
+				t.Fatalf("resolveAuthJSON(): %v", err)
+			}
+			if got := string(option.AuthJSON); got != value {
+				t.Fatalf("selected AuthJSON = %q, want B64 value %q", got, value)
+			}
+			_, err := chserver.NewServerWithAuthJSON(&option.Config, option.AuthJSON)
+			if err != nil {
+				t.Fatalf("NewServer(%s): %v", value, err)
+			}
+		})
+	}
+}
+
+func TestResolveClientRemotesPrefersPositionalArguments(t *testing.T) {
+	cliRemotes := []string{"3000", "R:2222:localhost:22"}
+	got, set, err := resolveClientRemotes(cliRemotes, `not JSON`, true, `not base64`, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if set || got != nil {
+		t.Fatalf("positional remotes should bypass env JSON: got=%q set=%t", got, set)
+	}
+}
+
+func TestResolveClientRemotesAcceptsPaddedAndUnpaddedBase64(t *testing.T) {
+	config := []byte(`["3000","R:2222:localhost:22"]`)
+	want := string(config)
+	for name, encoded := range map[string]string{
+		"padded":   base64.StdEncoding.EncodeToString(config),
+		"unpadded": base64.RawStdEncoding.EncodeToString(config),
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, set, err := resolveClientRemotes(nil, "", false, encoded, true)
+			if err != nil || !set || string(got) != want {
+				t.Fatalf("resolveClientRemotes() = %q, %t, %v; want %q", got, set, err, want)
+			}
+		})
+	}
+}
+
+func TestResolveClientRemotesAcceptsRawJSON(t *testing.T) {
+	want := `["3000","R:2222:localhost:22"]`
+	got, set, err := resolveClientRemotes(nil, want, true, "", false)
+	if err != nil || !set || string(got) != want {
+		t.Fatalf("resolveClientRemotes() = %q, %t, %v; want %q", got, set, err, want)
+	}
+}
+
+func TestResolveClientRemotesPrefersBase64Environment(t *testing.T) {
+	rawJSON := `["3000"]`
+	encodedJSON := base64.StdEncoding.EncodeToString([]byte(`["4000"]`))
+	got, set, err := resolveClientRemotes(nil, rawJSON, true, encodedJSON, true)
+	if err != nil || !set || string(got) != `["4000"]` {
+		t.Fatalf("resolveClientRemotes() = %q, %t, %v; want B64 remotes", got, set, err)
+	}
+	if _, _, err := resolveClientRemotes(nil, rawJSON, true, `invalid`, true); err == nil {
+		t.Fatal("invalid preferred B64 config must not fall back to raw JSON")
+	}
+}
+
+func TestResolveClientRemotesRejectsMissingOrInvalidBase64(t *testing.T) {
+	tests := []struct {
+		name        string
+		rawJSON     string
+		rawJSONSet  bool
+		encodedJSON string
+		encodedSet  bool
+	}{
+		{name: "unset"},
+		{name: "malformed Base64", encodedJSON: `%%%`, encodedSet: true},
+		{name: "noncanonical Base64 pad bits", encodedJSON: `Zh==`, encodedSet: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, _, err := resolveClientRemotes(nil, tt.rawJSON, tt.rawJSONSet, tt.encodedJSON, tt.encodedSet); err == nil {
+				t.Fatal("resolveClientRemotes() accepted missing or invalid remotes")
+			}
+		})
 	}
 }
